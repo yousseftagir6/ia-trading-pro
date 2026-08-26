@@ -1,5 +1,5 @@
 # ============================================================
-# 🌐 IA TRADING PRO - APPLICATION PRINCIPALE
+# 🌐 IA TRADING PRO - APPLICATION PRINCIPALE (CORRIGÉE)
 # ============================================================
 import streamlit as st
 import pandas as pd
@@ -7,9 +7,8 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import yfinance as yf
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import TimeSeriesSplit
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -80,10 +79,14 @@ st.markdown("""
 @st.cache_data(ttl=300)
 def load_data(ticker, period="5y"):
     """Charge les données avec cache"""
-    data = yf.download(ticker, period=period, interval="1d", progress=False)
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    return data
+    try:
+        data = yf.download(ticker, period=period, interval="1d", progress=False)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        return data
+    except Exception as e:
+        st.error(f"Erreur de téléchargement : {e}")
+        return pd.DataFrame()
 
 def calculate_indicators(data):
     """Calcule les indicateurs techniques"""
@@ -135,7 +138,17 @@ FEATURES = [
 ]
 
 def run_backtest(data, features, threshold, stop_loss, take_profit, capital_initial):
-    """Exécute le backtest"""
+    """Exécute le backtest avec fenêtre d'entraînement ajustable"""
+    if data.empty:
+        return capital_initial, [], []
+    
+    # Déterminer la taille de la fenêtre d'entraînement
+    # Au moins 50, au maximum 500, sinon 70% des données
+    train_days = min(500, max(50, int(len(data) * 0.7)))
+    if len(data) <= train_days + 10:
+        st.warning("Pas assez de données pour un backtest fiable. Augmentez la période.")
+        return capital_initial, [], []
+    
     capital = capital_initial
     position = 0
     entry_price = 0
@@ -146,10 +159,13 @@ def run_backtest(data, features, threshold, stop_loss, take_profit, capital_init
     model = None
     scaler = StandardScaler()
     
-    for i in range(500, len(data)):
+    for i in range(train_days, len(data)):
         # Réentraînement tous les 10 jours
-        if model is None or i % 10 == 0:
-            train_data = data.iloc[max(0, i-500):i]
+        if model is None or (i - train_days) % 10 == 0:
+            train_start = max(0, i - train_days)
+            train_data = data.iloc[train_start:i]
+            if len(train_data) < 50:
+                continue
             X_train = train_data[features]
             y_train = train_data['Target']
             X_train_scaled = scaler.fit_transform(X_train)
@@ -164,12 +180,14 @@ def run_backtest(data, features, threshold, stop_loss, take_profit, capital_init
         
         # Prédiction
         X_test = data[features].iloc[i:i+1]
-        X_test_scaled = scaler.transform(X_test)
-        
-        try:
-            prob_up = model.predict_proba(X_test_scaled)[0][1]
-        except:
+        if model is None:
             prob_up = 0.5
+        else:
+            X_test_scaled = scaler.transform(X_test)
+            try:
+                prob_up = model.predict_proba(X_test_scaled)[0][1]
+            except:
+                prob_up = 0.5
         
         current_price = data['Close'].iloc[i]
         
@@ -228,7 +246,8 @@ with st.sidebar:
     period = st.select_slider(
         "Historique",
         options=['1y', '2y', '3y', '5y'],
-        value='5y'
+        value='5y',
+        help="Choisissez au moins 2 ans pour un backtest fiable"
     )
     
     # Paramètres
@@ -266,113 +285,123 @@ if run_button:
     with st.spinner("🔍 Analyse en cours..."):
         # Chargement des données
         data_raw = load_data(ticker, period)
-        data = calculate_indicators(data_raw)
-        
-        # Backtest
-        capital, trades, equity = run_backtest(
-            data, FEATURES, threshold, stop_loss, take_profit, capital_initial
-        )
-        
-        # ============================================================
-        # RÉSULTATS
-        # ============================================================
-        st.markdown("## 📊 Résultats")
-        
-        # Métriques
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Capital Final", f"€{capital:,.2f}")
-        
-        with col2:
-            return_pct = (capital / capital_initial - 1) * 100
-            st.metric("Performance", f"{return_pct:+.2f}%")
-        
-        with col3:
-            if trades:
-                wins = len([t for t in trades if t['return'] > 0])
-                win_rate = wins / len(trades) * 100
-                st.metric("Win Rate", f"{win_rate:.1f}%")
-        
-        with col4:
-            st.metric("Trades", len(trades))
-        
-        # Graphique
-        st.markdown("## 📈 Graphique")
-        
-        fig = make_subplots(
-            rows=2, cols=1,
-            subplot_titles=('Performance', 'Drawdown'),
-            vertical_spacing=0.15
-        )
-        
-        # Performance
-        fig.add_trace(
-            go.Scatter(
-                y=equity,
-                mode='lines',
-                name='Capital',
-                line=dict(color='#667eea', width=2)
-            ),
-            row=1, col=1
-        )
-        
-        # Drawdown
-        equity_series = pd.Series(equity)
-        drawdown = (equity_series / equity_series.cummax() - 1) * 100
-        fig.add_trace(
-            go.Scatter(
-                y=drawdown,
-                mode='lines',
-                name='Drawdown',
-                fill='tozeroy',
-                line=dict(color='#f44336')
-            ),
-            row=2, col=1
-        )
-        
-        fig.update_layout(
-            height=600,
-            template='plotly_dark'
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Signal actuel
-        st.markdown("## 🎯 Signal Actuel")
-        
-        latest = data.iloc[-1]
-        
-        score = 0
-        if latest['EMA20'] > latest['EMA50']: score += 1
-        if latest['EMA50'] > latest['EMA200']: score += 1
-        if latest['RSI14'] > 50: score += 1
-        if latest['MACD'] > latest['MACD_SIGNAL']: score += 1
-        
-        if score >= 3:
-            st.markdown('<div class="signal-buy">🟢 ACHAT - Conditions favorables</div>', 
-                       unsafe_allow_html=True)
-        elif score == 2:
-            st.markdown('<div class="signal-neutral">🟡 ATTENTE - Conditions mitigées</div>', 
-                       unsafe_allow_html=True)
+        if data_raw.empty:
+            st.error("Impossible de télécharger les données. Vérifiez votre connexion ou réessayez.")
         else:
-            st.markdown('<div class="signal-sell">🔴 ÉVITER - Conditions défavorables</div>', 
-                       unsafe_allow_html=True)
-        
-        # Détails des trades
-        if trades:
-            st.markdown("## 📋 Détails des trades")
-            trades_df = pd.DataFrame(trades)
-            st.dataframe(trades_df, use_container_width=True)
+            data = calculate_indicators(data_raw)
             
-            # Téléchargement
-            csv = trades_df.to_csv(index=False)
-            st.download_button(
-                "📥 Télécharger (CSV)",
-                csv,
-                f"trades_{ticker}.csv",
-                "text/csv"
-            )
+            # Vérification des données
+            if data.empty:
+                st.error("Données insuffisantes après calcul des indicateurs. Essayez une période plus longue (ex: 5y).")
+            elif len(data) < 100:
+                st.warning(f"Seulement {len(data)} lignes de données. Les résultats peuvent être peu fiables.")
+                capital, trades, equity = run_backtest(data, FEATURES, threshold, stop_loss, take_profit, capital_initial)
+            else:
+                capital, trades, equity = run_backtest(data, FEATURES, threshold, stop_loss, take_profit, capital_initial)
+            
+            # ============================================================
+            # RÉSULTATS (affichés uniquement si backtest effectué)
+            # ============================================================
+            if equity:  # Si le backtest a produit des résultats
+                st.markdown("## 📊 Résultats")
+                
+                # Métriques
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Capital Final", f"€{capital:,.2f}")
+                
+                with col2:
+                    return_pct = (capital / capital_initial - 1) * 100
+                    st.metric("Performance", f"{return_pct:+.2f}%")
+                
+                with col3:
+                    if trades:
+                        wins = len([t for t in trades if t['return'] > 0])
+                        win_rate = wins / len(trades) * 100
+                        st.metric("Win Rate", f"{win_rate:.1f}%")
+                
+                with col4:
+                    st.metric("Trades", len(trades))
+                
+                # Graphique
+                st.markdown("## 📈 Graphique")
+                
+                fig = make_subplots(
+                    rows=2, cols=1,
+                    subplot_titles=('Performance', 'Drawdown'),
+                    vertical_spacing=0.15
+                )
+                
+                # Performance
+                fig.add_trace(
+                    go.Scatter(
+                        y=equity,
+                        mode='lines',
+                        name='Capital',
+                        line=dict(color='#667eea', width=2)
+                    ),
+                    row=1, col=1
+                )
+                
+                # Drawdown
+                equity_series = pd.Series(equity)
+                drawdown = (equity_series / equity_series.cummax() - 1) * 100
+                fig.add_trace(
+                    go.Scatter(
+                        y=drawdown,
+                        mode='lines',
+                        name='Drawdown',
+                        fill='tozeroy',
+                        line=dict(color='#f44336')
+                    ),
+                    row=2, col=1
+                )
+                
+                fig.update_layout(
+                    height=600,
+                    template='plotly_dark'
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Signal actuel
+                st.markdown("## 🎯 Signal Actuel")
+                
+                latest = data.iloc[-1]
+                
+                score = 0
+                if latest['EMA20'] > latest['EMA50']: score += 1
+                if latest['EMA50'] > latest['EMA200']: score += 1
+                if latest['RSI14'] > 50: score += 1
+                if latest['MACD'] > latest['MACD_SIGNAL']: score += 1
+                
+                if score >= 3:
+                    st.markdown('<div class="signal-buy">🟢 ACHAT - Conditions favorables</div>', 
+                               unsafe_allow_html=True)
+                elif score == 2:
+                    st.markdown('<div class="signal-neutral">🟡 ATTENTE - Conditions mitigées</div>', 
+                               unsafe_allow_html=True)
+                else:
+                    st.markdown('<div class="signal-sell">🔴 ÉVITER - Conditions défavorables</div>', 
+                               unsafe_allow_html=True)
+                
+                # Détails des trades
+                if trades:
+                    st.markdown("## 📋 Détails des trades")
+                    trades_df = pd.DataFrame(trades)
+                    st.dataframe(trades_df, use_container_width=True)
+                    
+                    # Téléchargement
+                    csv = trades_df.to_csv(index=False)
+                    st.download_button(
+                        "📥 Télécharger (CSV)",
+                        csv,
+                        f"trades_{ticker}.csv",
+                        "text/csv"
+                    )
+            else:
+                st.info("Aucun backtest effectué. Vérifiez les données et réessayez.")
 else:
     st.info("👈 Configurez vos paramètres et cliquez sur 'Lancer l'analyse'")
     
@@ -394,4 +423,10 @@ else:
     - ✅ Graphiques interactifs
     - ✅ Signaux en temps réel
     - ✅ Export des résultats
+    
+    ## ⚠️ Conseils
+    
+    - Utilisez une période d'au moins **2 ans** pour un backtest fiable.
+    - Ajustez le **seuil de probabilité** pour contrôler la sensibilité.
+    - Le **Stop Loss** et le **Take Profit** définissent votre gestion du risque.
     """)
